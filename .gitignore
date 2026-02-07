@@ -194,3 +194,6 @@ vid_cache/
 ## Semrel temporary stuff
 .semrel/
 semantic-release
+
+# Allow 3rd party developers to keep their scratch here
+localdev/
