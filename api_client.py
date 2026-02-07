@@ -2,7 +2,7 @@
 """
 StreamController DBus API client.
 
-A command-line tool to interact with the StreamController DBus API.
+A command-line tool and reusable client for the StreamController DBus API.
 
 Usage:
     python api_client.py controllers                              # List controller serial numbers
@@ -13,7 +13,7 @@ Usage:
     python api_client.py notify-foreground NAME CLASS             # Notify foreground app
     python api_client.py icon-packs                               # List icon packs
     python api_client.py icons PACK_ID                            # List icons in a pack
-    python api_client.py get-property [SERIAL] PROP               # Read a property
+    python api_client.py get-property [--serial SERIAL] PROP      # Read a property
     python api_client.py listen                                   # Listen for property changes
 """
 
@@ -24,9 +24,9 @@ import sys
 from dasbus.connection import SessionMessageBus
 from gi.repository import GLib
 
-SERVICE  = "com.core447.StreamController"
-OBJECT   = "/com/core447/StreamController"
-IFACE    = "com.core447.StreamController"
+SERVICE    = "com.core447.StreamController"
+OBJECT     = "/com/core447/StreamController"
+IFACE      = "com.core447.StreamController"
 CTRL_IFACE = "com.core447.StreamController.Controller"
 CTRL_BASE  = OBJECT + "/controllers"
 
@@ -35,197 +35,140 @@ def _serial_to_dbus_path(serial: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", serial)
 
 
-def get_proxy():
-    bus = SessionMessageBus()
-    return bus.get_proxy(SERVICE, OBJECT)
+class StreamControllerClient:
+    """Client for the StreamController DBus API."""
 
+    def __init__(self):
+        self._bus = SessionMessageBus()
 
-def get_controller_proxy(serial: str):
-    bus = SessionMessageBus()
-    path = f"{CTRL_BASE}/{_serial_to_dbus_path(serial)}"
-    return bus.get_proxy(SERVICE, path)
+    def _root_proxy(self):
+        return self._bus.get_proxy(SERVICE, OBJECT)
 
+    def _controller_proxy(self, serial: str):
+        path = f"{CTRL_BASE}/{_serial_to_dbus_path(serial)}"
+        return self._bus.get_proxy(SERVICE, path)
 
-# ── Commands ─────────────────────────────────────────────────────────
+    # ── Top-level operations ─────────────────────────────────────────
 
-def cmd_controllers(args):
-    proxy = get_proxy()
-    controllers = proxy.Controllers
-    if not controllers:
-        print("No controllers connected.")
-        return
-    for s in controllers:
-        print(s)
+    def get_controllers(self) -> list[str]:
+        """Return serial numbers of all connected controllers."""
+        return list(self._root_proxy().Controllers)
 
+    def get_pages(self) -> list[str]:
+        """Return a list of page names."""
+        return list(self._root_proxy().Pages)
 
-def cmd_pages(args):
-    proxy = get_proxy()
-    pages = proxy.Pages
-    if not pages:
-        print("No pages found.")
-        return
-    for p in pages:
-        print(p)
+    def add_page(self, name: str, json_contents: str = "") -> None:
+        """Add a new page with the given name and optional JSON contents."""
+        self._root_proxy().AddPage(name, json_contents)
 
+    def remove_page(self, name: str) -> None:
+        """Remove the page with the given name."""
+        self._root_proxy().RemovePage(name)
 
-def cmd_add_page(args):
-    proxy = get_proxy()
-    json_contents = args.json if args.json else ""
-    proxy.AddPage(args.name, json_contents)
-    print(f"Added page: {args.name}")
+    def notify_foreground(self, window_name: str, window_class: str) -> None:
+        """Notify StreamController of the current foreground application."""
+        self._root_proxy().NotifyForegroundApp(window_name, window_class)
 
+    def get_icon_packs(self) -> list[str]:
+        """Return a list of icon pack IDs."""
+        return list(self._root_proxy().IconPacks)
 
-def cmd_remove_page(args):
-    proxy = get_proxy()
-    proxy.RemovePage(args.name)
-    print(f"Removed page: {args.name}")
+    def get_icon_names(self, pack_id: str) -> list[str]:
+        """Return a list of icon names in the given pack."""
+        return list(self._root_proxy().GetIconNames(pack_id))
 
+    def get_property(self, name: str) -> object:
+        """Read a top-level property by name."""
+        return getattr(self._root_proxy(), name)
 
-def cmd_set_active_page(args):
-    proxy = get_controller_proxy(args.serial)
-    proxy.SetActivePage(args.name)
-    print(f"Set active page: {args.name}")
+    # ── Per-controller operations ────────────────────────────────────
 
+    def set_active_page(self, serial: str, name: str) -> None:
+        """Set the active page on the given controller."""
+        self._controller_proxy(serial).SetActivePage(name)
 
-def cmd_notify_foreground(args):
-    proxy = get_proxy()
-    proxy.NotifyForegroundApp(args.window_name, args.window_class)
-    print(f"Notified foreground app: name={args.window_name!r} class={args.window_class!r}")
+    def get_controller_property(self, serial: str, name: str) -> object:
+        """Read a property from a specific controller."""
+        return getattr(self._controller_proxy(serial), name)
 
+    # ── Listener ─────────────────────────────────────────────────────
 
-def cmd_icon_packs(args):
-    proxy = get_proxy()
-    packs = proxy.IconPacks
-    if not packs:
-        print("No icon packs found.")
-        return
-    for p in packs:
-        print(p)
+    def listen(self, callback=None):
+        """
+        Listen for PropertiesChanged signals. Blocks until interrupted.
 
+        callback(object_path, interface, property_name, value) is called
+        for each change.  If callback is None, changes are printed to stdout.
+        """
+        connection = self._bus.connection
 
-def cmd_icons(args):
-    proxy = get_proxy()
-    icons = proxy.GetIconNames(args.pack_id)
-    if not icons:
-        print(f"No icons found in pack: {args.pack_id}")
-        return
-    for icon in icons:
-        print(icon)
-
-
-def cmd_get_property(args):
-    prop = args.property_name
-    if args.serial:
-        proxy = get_controller_proxy(args.serial)
-    else:
-        proxy = get_proxy()
-    try:
-        value = getattr(proxy, prop)
-        print(f"{prop} = {value!r}")
-    except AttributeError:
-        print(f"Unknown property: {prop}", file=sys.stderr)
-        sys.exit(1)
-
-
-def cmd_listen(args):
-    """Listen for PropertiesChanged signals on all objects and print them."""
-    bus = SessionMessageBus()
-    connection = bus.connection
-
-    def on_properties_changed(connection, sender, object_path,
-                              interface_name, signal_name, parameters):
-        iface, changed, invalidated = parameters.unpack()
-        prefix = f"[{object_path}]" if object_path != OBJECT else "[root]"
-        for prop, value in changed.items():
+        def _default_callback(object_path, iface, prop, value):
+            prefix = "[root]" if object_path == OBJECT else f"[{object_path}]"
             print(f"{prefix} {iface} {prop} = {value!r}")
-        for prop in invalidated:
-            print(f"{prefix} {iface} {prop} (invalidated)")
 
-    # Listen on the root object
-    connection.signal_subscribe(
-        SERVICE, "org.freedesktop.DBus.Properties", "PropertiesChanged",
-        OBJECT, None, 0, on_properties_changed,
-    )
-    # Listen on all controller sub-objects (path_namespace match not available,
-    # so use None for path and filter in callback)
-    connection.signal_subscribe(
-        SERVICE, "org.freedesktop.DBus.Properties", "PropertiesChanged",
-        None, None, 0, on_properties_changed,
-    )
+        cb = callback or _default_callback
 
-    print(f"Listening for property changes on {SERVICE} …  (Ctrl+C to stop)")
-    loop = GLib.MainLoop()
-    try:
-        loop.run()
-    except KeyboardInterrupt:
-        print("\nStopped.")
+        def on_signal(conn, sender, object_path, iface, signal, params):
+            sig_iface, changed, invalidated = params.unpack()
+            for prop, value in changed.items():
+                cb(object_path, sig_iface, prop, value)
+            for prop in invalidated:
+                cb(object_path, sig_iface, prop, None)
+
+        # Subscribe on root and all sub-objects
+        for path in (OBJECT, None):
+            connection.signal_subscribe(
+                SERVICE, "org.freedesktop.DBus.Properties",
+                "PropertiesChanged", path, None, 0, on_signal,
+            )
+
+        print(f"Listening for property changes on {SERVICE} …  (Ctrl+C to stop)")
+        loop = GLib.MainLoop()
+        try:
+            loop.run()
+        except KeyboardInterrupt:
+            print("\nStopped.")
 
 
-# ── Argument parser ──────────────────────────────────────────────────
+# ── CLI ──────────────────────────────────────────────────────────────
 
 def build_parser():
-    parser = argparse.ArgumentParser(
-        description="StreamController DBus API client",
-    )
+    parser = argparse.ArgumentParser(description="StreamController DBus API client")
     sub = parser.add_subparsers(dest="command")
 
-    # controllers
     sub.add_parser("controllers", help="List connected controller serial numbers")
-
-    # pages
     sub.add_parser("pages", help="List all pages")
 
-    # add-page
     p = sub.add_parser("add-page", help="Add a new page")
     p.add_argument("name", help="Page name")
     p.add_argument("json", nargs="?", default="", help="JSON contents (optional)")
 
-    # remove-page
     p = sub.add_parser("remove-page", help="Remove a page")
     p.add_argument("name", help="Page name")
 
-    # set-active-page
     p = sub.add_parser("set-active-page", help="Set the active page on a controller")
     p.add_argument("serial", help="Controller serial number")
     p.add_argument("name", help="Page name")
 
-    # notify-foreground
     p = sub.add_parser("notify-foreground", help="Notify foreground application")
     p.add_argument("window_name", help="Window title")
     p.add_argument("window_class", help="Window WM_CLASS")
 
-    # icon-packs
     sub.add_parser("icon-packs", help="List icon packs")
 
-    # icons
     p = sub.add_parser("icons", help="List icons in a pack")
     p.add_argument("pack_id", help="Icon pack ID")
 
-    # get-property
     p = sub.add_parser("get-property", help="Read a DBus property")
     p.add_argument("--serial", "-s", default=None,
                    help="Controller serial (omit for top-level properties)")
     p.add_argument("property_name",
-                   help="Property name (Controllers, ForegroundWindowName, ActivePageName, …)")
+                   help="Property name (Controllers, Pages, ActivePageName, …)")
 
-    # listen
     sub.add_parser("listen", help="Listen for property change notifications")
 
     return parser
-
-
-DISPATCH = {
-    "controllers":      cmd_controllers,
-    "pages":            cmd_pages,
-    "add-page":         cmd_add_page,
-    "remove-page":      cmd_remove_page,
-    "set-active-page":  cmd_set_active_page,
-    "notify-foreground": cmd_notify_foreground,
-    "icon-packs":       cmd_icon_packs,
-    "icons":            cmd_icons,
-    "get-property":     cmd_get_property,
-    "listen":           cmd_listen,
-}
 
 
 def main():
@@ -236,13 +179,63 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    handler = DISPATCH.get(args.command)
-    if handler is None:
-        parser.print_help()
-        sys.exit(1)
+    client = StreamControllerClient()
 
     try:
-        handler(args)
+        if args.command == "controllers":
+            for s in client.get_controllers():
+                print(s)
+
+        elif args.command == "pages":
+            pages = client.get_pages()
+            if not pages:
+                print("No pages found.")
+            else:
+                for p in pages:
+                    print(p)
+
+        elif args.command == "add-page":
+            client.add_page(args.name, args.json or "")
+            print(f"Added page: {args.name}")
+
+        elif args.command == "remove-page":
+            client.remove_page(args.name)
+            print(f"Removed page: {args.name}")
+
+        elif args.command == "set-active-page":
+            client.set_active_page(args.serial, args.name)
+            print(f"Set active page: {args.name}")
+
+        elif args.command == "notify-foreground":
+            client.notify_foreground(args.window_name, args.window_class)
+            print(f"Notified foreground app: name={args.window_name!r} class={args.window_class!r}")
+
+        elif args.command == "icon-packs":
+            packs = client.get_icon_packs()
+            if not packs:
+                print("No icon packs found.")
+            else:
+                for p in packs:
+                    print(p)
+
+        elif args.command == "icons":
+            icons = client.get_icon_names(args.pack_id)
+            if not icons:
+                print(f"No icons found in pack: {args.pack_id}")
+            else:
+                for icon in icons:
+                    print(icon)
+
+        elif args.command == "get-property":
+            if args.serial:
+                value = client.get_controller_property(args.serial, args.property_name)
+            else:
+                value = client.get_property(args.property_name)
+            print(f"{args.property_name} = {value!r}")
+
+        elif args.command == "listen":
+            client.listen()
+
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
