@@ -17,6 +17,7 @@ Per-controller objects: /com/core447/StreamController/controllers/<serial>
 import json
 import os
 import re
+from src.Signals import Signals
 from loguru import logger as log
 
 from dasbus.server.interface import dbus_interface
@@ -109,7 +110,10 @@ class StreamControllerAPI:
         try:
             page_dict = json.loads(json_contents) if json_contents else {}
             if gl.page_manager is not None:
-                gl.page_manager.add_page(name, page_dict)
+                path = gl.page_manager.add_page(name, page_dict)
+                gl.page_manager.update_dict_of_pages_with_path(path)
+                gl.page_manager.reload_pages_with_path(path)
+                gl.signal_manager.trigger_signal(Signals.PageAdd, path)
         except json.JSONDecodeError as e:
             log.error(f"DBus API: AddPage – invalid JSON: {e}")
         except Exception as e:
@@ -123,6 +127,7 @@ class StreamControllerAPI:
                 page_path = os.path.join(gl.page_manager.PAGE_PATH, f"{name}.json")
                 if os.path.exists(page_path):
                     gl.page_manager.remove_page(page_path)
+                    gl.signal_manager.trigger_signal(Signals.PageDelete, page_path)
                 else:
                     log.warning(f"DBus API: RemovePage – page not found: {name}")
         except Exception as e:
