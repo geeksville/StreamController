@@ -12,6 +12,8 @@ Top-level object: /com/core447/StreamController
 Per-controller objects: /com/core447/StreamController/controllers/<serial>
   - SetActivePage
   - ActivePageName property
+
+Uses dbus-python (dbus.service) to expose the API.
 """
 
 import json
@@ -20,14 +22,107 @@ import re
 from src.Signals import Signals
 from loguru import logger as log
 
-from dasbus.server.interface import dbus_interface
-from dasbus.connection import SessionMessageBus
-from dasbus.typing import Str, List
-
 import globals as gl
 
+if not gl.IS_MAC:
+    import dbus
+    import dbus.service
+
+DBUS_BUS_NAME = "com.core447.StreamController"
 DBUS_OBJECT_PATH = "/com/core447/StreamController"
 CONTROLLER_BASE_PATH = DBUS_OBJECT_PATH + "/controllers"
+
+TOPLEVEL_IFACE = "com.core447.StreamController"
+CONTROLLER_IFACE = "com.core447.StreamController.Controller"
+PROPERTIES_IFACE = "org.freedesktop.DBus.Properties"
+INTROSPECTABLE_IFACE = "org.freedesktop.DBus.Introspectable"
+
+# ── Introspection XML ────────────────────────────────────────────────
+
+TOPLEVEL_INTROSPECTION_XML = f"""\
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node name="{DBUS_OBJECT_PATH}">
+  <interface name="{TOPLEVEL_IFACE}">
+    <method name="AddPage">
+      <arg direction="in" type="s" name="name"/>
+      <arg direction="in" type="s" name="json_contents"/>
+    </method>
+    <method name="RemovePage">
+      <arg direction="in" type="s" name="name"/>
+    </method>
+    <method name="NotifyForegroundApp">
+      <arg direction="in" type="s" name="window_name"/>
+      <arg direction="in" type="s" name="window_class"/>
+    </method>
+    <method name="GetIconNames">
+      <arg direction="in" type="s" name="icon_pack_id"/>
+      <arg direction="out" type="as" name="icon_names"/>
+    </method>
+    <property name="Controllers" type="as" access="read"/>
+    <property name="Pages" type="as" access="read"/>
+    <property name="IconPacks" type="as" access="read"/>
+    <property name="ForegroundWindowName" type="s" access="readwrite"/>
+    <property name="ForegroundWindowClass" type="s" access="readwrite"/>
+  </interface>
+  <interface name="{PROPERTIES_IFACE}">
+    <method name="Get">
+      <arg direction="in" type="s" name="interface_name"/>
+      <arg direction="in" type="s" name="property_name"/>
+      <arg direction="out" type="v" name="value"/>
+    </method>
+    <method name="Set">
+      <arg direction="in" type="s" name="interface_name"/>
+      <arg direction="in" type="s" name="property_name"/>
+      <arg direction="in" type="v" name="value"/>
+    </method>
+    <method name="GetAll">
+      <arg direction="in" type="s" name="interface_name"/>
+      <arg direction="out" type="a{{sv}}" name="properties"/>
+    </method>
+  </interface>
+  <interface name="{INTROSPECTABLE_IFACE}">
+    <method name="Introspect">
+      <arg direction="out" type="s" name="xml_data"/>
+    </method>
+  </interface>
+</node>
+"""
+
+CONTROLLER_INTROSPECTION_XML = """\
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node>
+  <interface name="{iface}">
+    <method name="SetActivePage">
+      <arg direction="in" type="s" name="name"/>
+    </method>
+    <property name="ActivePageName" type="s" access="readwrite"/>
+  </interface>
+  <interface name="{props_iface}">
+    <method name="Get">
+      <arg direction="in" type="s" name="interface_name"/>
+      <arg direction="in" type="s" name="property_name"/>
+      <arg direction="out" type="v" name="value"/>
+    </method>
+    <method name="Set">
+      <arg direction="in" type="s" name="interface_name"/>
+      <arg direction="in" type="s" name="property_name"/>
+      <arg direction="in" type="v" name="value"/>
+    </method>
+    <method name="GetAll">
+      <arg direction="in" type="s" name="interface_name"/>
+      <arg direction="out" type="a{{sv}}" name="properties"/>
+    </method>
+  </interface>
+  <interface name="{intro_iface}">
+    <method name="Introspect">
+      <arg direction="out" type="s" name="xml_data"/>
+    </method>
+  </interface>
+</node>
+""".format(iface=CONTROLLER_IFACE, props_iface=PROPERTIES_IFACE,
+           intro_iface=INTROSPECTABLE_IFACE)
 
 
 def _serial_to_dbus_path(serial: str) -> str:
@@ -40,17 +135,26 @@ def _serial_to_dbus_path(serial: str) -> str:
 # Per-controller API (published at .../controllers/<serial>)
 # ─────────────────────────────────────────────────────────────────────
 
-@dbus_interface("com.core447.StreamController.Controller")
-class ControllerInstanceAPI:
+class ControllerInstanceAPI(dbus.service.Object):
     """DBus interface for a single StreamDeck controller."""
 
-    def __init__(self, controller):
+    def __init__(self, controller, bus_name, obj_path):
         self._controller = controller
         self._active_page_name: str = ""
+        super().__init__(bus_name, obj_path)
+
+    # ── Introspection ────────────────────────────────────────────────
+
+    @dbus.service.method(INTROSPECTABLE_IFACE,
+                         in_signature='', out_signature='s')
+    def Introspect(self):
+        return CONTROLLER_INTROSPECTION_XML
 
     # ── Methods ──────────────────────────────────────────────────────
 
-    def SetActivePage(self, name: Str) -> None:
+    @dbus.service.method(CONTROLLER_IFACE,
+                         in_signature='s', out_signature='')
+    def SetActivePage(self, name):
         """Set the active page on this controller."""
         serial = self._controller.serial_number()
         log.info(f"DBus API [{serial}]: SetActivePage called – name={name!r}")
@@ -66,45 +170,64 @@ class ControllerInstanceAPI:
         except Exception as e:
             log.error(f"DBus API [{serial}]: SetActivePage error: {e}")
 
-    # ── Properties ───────────────────────────────────────────────────
+    # ── Properties via org.freedesktop.DBus.Properties ───────────────
 
-    @property
-    def ActivePageName(self) -> Str:
-        """The name of the currently active page on this controller."""
-        return self._active_page_name
+    @dbus.service.method(PROPERTIES_IFACE,
+                         in_signature='ss', out_signature='v')
+    def Get(self, interface_name, property_name):
+        if interface_name == CONTROLLER_IFACE:
+            if property_name == "ActivePageName":
+                return self._active_page_name
+        raise dbus.exceptions.DBusException(
+            f"Unknown property: {interface_name}.{property_name}",
+            name="org.freedesktop.DBus.Error.UnknownProperty")
 
-    @ActivePageName.setter
-    def ActivePageName(self, value: Str):
-        self._active_page_name = value
-        log.debug(f"DBus API [{self._controller.serial_number()}]: ActivePageName changed to {value!r}")
+    @dbus.service.method(PROPERTIES_IFACE,
+                         in_signature='ssv', out_signature='')
+    def Set(self, interface_name, property_name, value):
+        if interface_name == CONTROLLER_IFACE:
+            if property_name == "ActivePageName":
+                self._active_page_name = str(value)
+                log.debug(
+                    f"DBus API [{self._controller.serial_number()}]: "
+                    f"ActivePageName changed to {self._active_page_name!r}")
+                return
+        raise dbus.exceptions.DBusException(
+            f"Unknown property: {interface_name}.{property_name}",
+            name="org.freedesktop.DBus.Error.UnknownProperty")
+
+    @dbus.service.method(PROPERTIES_IFACE,
+                         in_signature='s', out_signature='a{sv}')
+    def GetAll(self, interface_name):
+        if interface_name == CONTROLLER_IFACE:
+            return {"ActivePageName": self._active_page_name}
+        return {}
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Top-level API (published at /com/core447/StreamController)
 # ─────────────────────────────────────────────────────────────────────
 
-@dbus_interface("com.core447.StreamController")
-class StreamControllerAPI:
+class StreamControllerAPI(dbus.service.Object):
     """DBus interface for StreamController (top-level)."""
 
-    def __init__(self):
+    def __init__(self, bus_name, obj_path):
         self._foreground_window_name: str = ""
         self._foreground_window_class: str = ""
+        super().__init__(bus_name, obj_path)
+
+    # ── Introspection ────────────────────────────────────────────────
+
+    @dbus.service.method(INTROSPECTABLE_IFACE,
+                         in_signature='', out_signature='s')
+    def Introspect(self):
+        return TOPLEVEL_INTROSPECTION_XML
 
     # ── Methods ──────────────────────────────────────────────────────
 
-    @property
-    def Pages(self) -> List[Str]:
-        """Return a list of page names."""
-        log.info("DBus API: Pages read")
-        try:
-            if gl.page_manager is not None:
-                return gl.page_manager.get_page_names()
-        except Exception as e:
-            log.error(f"DBus API: Pages error: {e}")
-        return []
-
-    def AddPage(self, name: Str, json_contents: Str) -> None:
+    @dbus.service.method(TOPLEVEL_IFACE,
+                         in_signature='ss', out_signature='')
+    def AddPage(self, name, json_contents):
         """Add a new page with the given name and JSON contents."""
         log.info(f"DBus API: AddPage called – name={name!r}")
         try:
@@ -119,7 +242,9 @@ class StreamControllerAPI:
         except Exception as e:
             log.error(f"DBus API: AddPage error: {e}")
 
-    def RemovePage(self, name: Str) -> None:
+    @dbus.service.method(TOPLEVEL_IFACE,
+                         in_signature='s', out_signature='')
+    def RemovePage(self, name):
         """Remove the page with the given name."""
         log.info(f"DBus API: RemovePage called – name={name!r}")
         try:
@@ -133,7 +258,9 @@ class StreamControllerAPI:
         except Exception as e:
             log.error(f"DBus API: RemovePage error: {e}")
 
-    def NotifyForegroundApp(self, window_name: Str, window_class: Str) -> None:
+    @dbus.service.method(TOPLEVEL_IFACE,
+                         in_signature='ss', out_signature='')
+    def NotifyForegroundApp(self, window_name, window_class):
         """
         Notify StreamController of the current foreground application.
         Useful for testing/development without kdotool.
@@ -153,19 +280,9 @@ class StreamControllerAPI:
         except Exception as e:
             log.error(f"DBus API: NotifyForegroundApp error: {e}")
 
-    @property
-    def IconPacks(self) -> List[Str]:
-        """Return a list of icon pack IDs."""
-        log.info("DBus API: IconPacks read")
-        try:
-            if gl.icon_pack_manager is not None:
-                packs = gl.icon_pack_manager.get_icon_packs()
-                return list(packs.keys())
-        except Exception as e:
-            log.error(f"DBus API: IconPacks error: {e}")
-        return []
-
-    def GetIconNames(self, icon_pack_id: Str) -> List[Str]:
+    @dbus.service.method(TOPLEVEL_IFACE,
+                         in_signature='s', out_signature='as')
+    def GetIconNames(self, icon_pack_id):
         """Return a list of all icon names in the given icon pack."""
         log.info(f"DBus API: GetIconNames called – icon_pack_id={icon_pack_id!r}")
         try:
@@ -174,60 +291,109 @@ class StreamControllerAPI:
                 pack = packs.get(icon_pack_id)
                 if pack is None:
                     log.warning(f"DBus API: GetIconNames – pack not found: {icon_pack_id}")
-                    return []
+                    return dbus.Array([], signature='s')
                 icons = pack.get_icons()
-                return [icon.name for icon in icons]
+                return dbus.Array([icon.name for icon in icons], signature='s')
         except Exception as e:
             log.error(f"DBus API: GetIconNames error: {e}")
-        return []
+        return dbus.Array([], signature='s')
 
-    # ── Properties ───────────────────────────────────────────────────
+    # ── Properties via org.freedesktop.DBus.Properties ───────────────
 
-    @property
-    def Controllers(self) -> List[Str]:
-        """Serial numbers of all connected controllers."""
-        try:
-            if gl.deck_manager is not None:
-                return [c.serial_number() for c in gl.deck_manager.deck_controller]
-        except Exception as e:
-            log.error(f"DBus API: Controllers error: {e}")
-        return []
+    def _get_property(self, property_name):
+        """Internal helper to read a property value."""
+        if property_name == "Controllers":
+            try:
+                if gl.deck_manager is not None:
+                    return dbus.Array(
+                        [c.serial_number() for c in gl.deck_manager.deck_controller],
+                        signature='s')
+            except Exception as e:
+                log.error(f"DBus API: Controllers error: {e}")
+            return dbus.Array([], signature='s')
 
-    @property
-    def ForegroundWindowName(self) -> Str:
-        """The title of the current foreground window."""
-        return self._foreground_window_name
+        if property_name == "Pages":
+            log.info("DBus API: Pages read")
+            try:
+                if gl.page_manager is not None:
+                    return dbus.Array(gl.page_manager.get_page_names(), signature='s')
+            except Exception as e:
+                log.error(f"DBus API: Pages error: {e}")
+            return dbus.Array([], signature='s')
 
-    @ForegroundWindowName.setter
-    def ForegroundWindowName(self, value: Str):
-        self._foreground_window_name = value
-        log.debug(f"DBus API: ForegroundWindowName changed to {value!r}")
+        if property_name == "IconPacks":
+            log.info("DBus API: IconPacks read")
+            try:
+                if gl.icon_pack_manager is not None:
+                    packs = gl.icon_pack_manager.get_icon_packs()
+                    return dbus.Array(list(packs.keys()), signature='s')
+            except Exception as e:
+                log.error(f"DBus API: IconPacks error: {e}")
+            return dbus.Array([], signature='s')
 
-    @property
-    def ForegroundWindowClass(self) -> Str:
-        """The WM_CLASS of the current foreground window."""
-        return self._foreground_window_class
+        if property_name == "ForegroundWindowName":
+            return self._foreground_window_name
 
-    @ForegroundWindowClass.setter
-    def ForegroundWindowClass(self, value: Str):
-        self._foreground_window_class = value
-        log.debug(f"DBus API: ForegroundWindowClass changed to {value!r}")
+        if property_name == "ForegroundWindowClass":
+            return self._foreground_window_class
+
+        return None
+
+    @dbus.service.method(PROPERTIES_IFACE,
+                         in_signature='ss', out_signature='v')
+    def Get(self, interface_name, property_name):
+        if interface_name == TOPLEVEL_IFACE:
+            val = self._get_property(property_name)
+            if val is not None:
+                return val
+        raise dbus.exceptions.DBusException(
+            f"Unknown property: {interface_name}.{property_name}",
+            name="org.freedesktop.DBus.Error.UnknownProperty")
+
+    @dbus.service.method(PROPERTIES_IFACE,
+                         in_signature='ssv', out_signature='')
+    def Set(self, interface_name, property_name, value):
+        if interface_name == TOPLEVEL_IFACE:
+            if property_name == "ForegroundWindowName":
+                self._foreground_window_name = str(value)
+                log.debug(f"DBus API: ForegroundWindowName changed to {value!r}")
+                return
+            if property_name == "ForegroundWindowClass":
+                self._foreground_window_class = str(value)
+                log.debug(f"DBus API: ForegroundWindowClass changed to {value!r}")
+                return
+        raise dbus.exceptions.DBusException(
+            f"Unknown or read-only property: {interface_name}.{property_name}",
+            name="org.freedesktop.DBus.Error.UnknownProperty")
+
+    @dbus.service.method(PROPERTIES_IFACE,
+                         in_signature='s', out_signature='a{sv}')
+    def GetAll(self, interface_name):
+        if interface_name == TOPLEVEL_IFACE:
+            return {
+                "Controllers": self._get_property("Controllers"),
+                "Pages": self._get_property("Pages"),
+                "IconPacks": self._get_property("IconPacks"),
+                "ForegroundWindowName": self._foreground_window_name,
+                "ForegroundWindowClass": self._foreground_window_class,
+            }
+        return dbus.Dictionary({}, signature='sv')
 
 
 # ── Helper to start / stop the service ──────────────────────────────
 
-_bus = None
+_bus_name = None
 _api_instance = None
 _controller_instances: dict[str, ControllerInstanceAPI] = {}
 
 
 def start_dbus_service():
     """Publish the StreamController API on the session bus."""
-    global _bus, _api_instance
+    global _bus_name, _api_instance
     try:
-        _bus = SessionMessageBus()
-        _api_instance = StreamControllerAPI()
-        _bus.publish_object(DBUS_OBJECT_PATH, _api_instance)
+        bus = dbus.SessionBus()
+        _bus_name = dbus.service.BusName(DBUS_BUS_NAME, bus=bus)
+        _api_instance = StreamControllerAPI(_bus_name, DBUS_OBJECT_PATH)
 
         # Publish a sub-object for each connected controller
         if gl.deck_manager is not None:
@@ -241,36 +407,41 @@ def start_dbus_service():
 
 def _publish_controller(controller):
     """Publish a ControllerInstanceAPI for a single deck controller."""
-    global _bus
+    global _bus_name
     serial = controller.serial_number()
     if serial in _controller_instances:
         return  # already published
     path_component = _serial_to_dbus_path(serial)
     obj_path = f"{CONTROLLER_BASE_PATH}/{path_component}"
-    instance = ControllerInstanceAPI(controller)
+    instance = ControllerInstanceAPI(controller, _bus_name, obj_path)
     _controller_instances[serial] = instance
-    _bus.publish_object(obj_path, instance)
     log.info(f"DBus API: published controller {serial} at {obj_path}")
 
 
 def stop_dbus_service():
-    """Disconnect from the session bus."""
-    global _bus
+    """Remove objects from the session bus."""
+    global _bus_name, _api_instance
     try:
-        if _bus is not None:
-            _bus.disconnect()
-            _bus = None
-            _controller_instances.clear()
-            log.info("DBus API service stopped")
+        if _api_instance is not None:
+            _api_instance.remove_from_connection()
+            _api_instance = None
+        for inst in _controller_instances.values():
+            try:
+                inst.remove_from_connection()
+            except Exception:
+                pass
+        _controller_instances.clear()
+        _bus_name = None
+        log.info("DBus API service stopped")
     except Exception as e:
         log.error(f"Failed to stop DBus API service: {e}")
 
 
-def get_api_instance() -> StreamControllerAPI | None:
+def get_api_instance() -> "StreamControllerAPI | None":
     """Return the active top-level API instance, or None if not started."""
     return _api_instance
 
 
-def get_controller_instance(serial: str) -> ControllerInstanceAPI | None:
+def get_controller_instance(serial: str) -> "ControllerInstanceAPI | None":
     """Return the API instance for a specific controller, or None."""
     return _controller_instances.get(serial)
